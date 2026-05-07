@@ -8,6 +8,9 @@ import os
 import subprocess
 from datetime import datetime
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 CONTEXT_WINDOW = 200_000
 
 def read_json_stdin():
