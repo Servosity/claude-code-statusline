@@ -104,7 +104,7 @@ def newest_main_usage_by_timestamp(transcript_path):
     latest_usage = None
 
     try:
-        with open(transcript_path, 'r') as f:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except:
         return None
