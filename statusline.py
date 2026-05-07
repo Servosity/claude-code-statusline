@@ -8,7 +8,8 @@ import os
 import subprocess
 from datetime import datetime
 
-CONTEXT_WINDOW = 200_000
+def context_window_for(model_id):
+    return 1_000_000 if '[1m]' in model_id.lower() else 200_000
 
 def read_json_stdin():
     try:
@@ -185,14 +186,15 @@ def main():
         return
 
     # Calculate usage
+    context_window = context_window_for(model_id)
     used = used_total(usage)
-    pct = round((used * 1000) / CONTEXT_WINDOW) / 10 if CONTEXT_WINDOW > 0 else 0
+    pct = round((used * 1000) / context_window) / 10 if context_window > 0 else 0
 
     # Usage display with progress bar
     bar_width = 20
     filled = int((pct / 100) * bar_width)
     bar = "█" * filled + "░" * (bar_width - filled)
-    usage_display = f"{color(pct)}{pct:.1f}%\033[0m {bar} \033[33m{format_k(used)}/{format_k(CONTEXT_WINDOW)}\033[0m"
+    usage_display = f"{color(pct)}{pct:.1f}%\033[0m {bar} \033[33m{format_k(used)}/{format_k(context_window)}\033[0m"
 
     # Build status line
     parts = [
