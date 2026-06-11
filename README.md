@@ -1,6 +1,6 @@
 # claude-code-statusline
 
-A two-line status line for [Claude Code](https://docs.claude.com/en/docs/claude-code/statusline) that shows the current model, working directory, git branch, date + time, and accurate context-window usage with a progress bar.
+A two-line status line for [Claude Code](https://docs.claude.com/en/docs/claude-code/statusline) that shows the current model, working directory, git branch, date + time, accurate context-window usage with a progress bar, and session cost / tokens / duration.
 
 ![Example output](docs/example.png)
 
@@ -8,9 +8,17 @@ A two-line status line for [Claude Code](https://docs.claude.com/en/docs/claude-
 
 **Line 1** — model · `📁 cwd` · `(branch)` · `⏱️  May 7 09:05:14`
 
-**Line 2** — `context: 18.9% ███░░░░░░░░░░░░░░░░░ 37.7k/200k`
+**Line 2** — `context: [███░░░░░░░░░░░░░░░░░░░░░░░] 145k/1M 14.5% | $3.18 | 294k tok | 1h 12m`
 
-Context usage is computed from the transcript by summing `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` on the most recent main-thread assistant turn (sub-context, synthetic, error, and "no response requested" turns are excluded). The percentage is colored green / yellow / red at 70 % and 90 % thresholds.
+**Context bar.** Usage is computed from the transcript by summing `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` on the most recent main-thread assistant turn (sub-context, synthetic, error, and "no response requested" turns are excluded). The bar is **scaled to the real context window** — detected from the `context_window.context_window_size` field Claude Code passes on stdin (falling back to a `1m` marker in the model id, then to `200_000`), so a 1M-context model reads `/1M` instead of pinning full at 200k.
+
+The bar is a **bracketed gradient** that reads as one continuous window. Filled cells (`█`) use a bright green→yellow→orange→red ramp; the empty track (`░`) shows a dim "heat-ahead" version of the same ramp, so you can see the spectrum that lies ahead without any divider glyphs. The gradient is **anchored to the 120k / 180k / 300k / 500k thresholds** (`green@0 → yellow@120k → orange@180k → red@300k → deep red@500k+`), so position-in-the-window maps to color. The percentage takes the gradient color at the current usage. Retune `GRAD_ANCHORS` / `GRAD_RAMP` / `GRAD_MUTED` to change the stops or palette.
+
+**Session stats** (appended to line 2, each shown only when present):
+
+- **cost** — `cost.total_cost_usd` from stdin (`$3.18`).
+- **tokens** — cumulative tokens *processed* this session, **including subagent / Task (sidechain) turns**: `input + output + cache_read + cache_creation` summed across every transcript message. Cache reads recur per turn by design, so this is a processed total (pairs with cost), not a unique-token count.
+- **duration** — `cost.total_duration_ms` from stdin, wall-clock since session start (`1h 12m`).
 
 ## Install
 
@@ -83,7 +91,11 @@ Open `statusline.py` and edit the constants near the top:
 
 | Constant | Default | What it controls |
 | --- | --- | --- |
-| `CONTEXT_WINDOW` | `200_000` | Total context budget used to compute the percentage. Bump to `1_000_000` for the 1M-context Opus tier. |
+| `BAR_WIDTH` | `26` | Width of the gradient bar in characters (excludes the `[ ]` brackets). |
+| `DEFAULT_CONTEXT_WINDOW` | `200_000` | Fallback window when Claude Code doesn't report `context_window.context_window_size` and the model id has no `1m` marker. The window is auto-detected at runtime — no need to hard-code the 1M tier. |
+| `GRAD_RAMP` | green→red 256-color list | Bright ramp for the filled cells (and the percentage color). |
+| `GRAD_MUTED` | dim parallel ramp | "Heat-ahead" ramp for the empty track. |
+| `GRAD_ANCHORS` | `[(0,0), (120k,5/11), (180k,8/11), (300k,10/11), (500k,1.0)]` | Token→gradient-fraction stops. Move these to shift where green/yellow/orange/red land. |
 
 The model icon is selected from the model id: 🚀 Opus, 🧠 Sonnet, ⚡ Haiku, 🤖 anything else.
 
