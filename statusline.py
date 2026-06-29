@@ -154,30 +154,48 @@ def parse_timestamp(j):
             pass
     return float('-inf')
 
+def is_tool_result_msg(msg):
+    """A user-role message carrying tool_result blocks is a tool RETURN, not a human
+    turn — the gap before it was tool execution (a CI watch, an agent run), not you
+    being waited on. Used to keep that time in the 'active' total."""
+    content = msg.get('content')
+    if isinstance(content, list):
+        return any(isinstance(i, dict) and i.get('type') == 'tool_result' for i in content)
+    return False
+
 def scan_transcript(transcript_path):
     """Single pass over the transcript.
 
-    Returns (current_main_usage, cumulative_tokens):
+    Returns (current_main_usage, cum_in, cum_out, active_ms):
       current_main_usage = newest real non-sidechain assistant usage -> the bar numerator
                            (current context occupancy).
-      cumulative_tokens  = input+output+cache_read+cache_creation summed across EVERY message
-                           INCLUDING sidechains (subagent/Task turns). This is the
-                           "tokens processed this session" figure that pairs with cost;
-                           cache reads recur each turn by design, so it is a processed
-                           total, not a unique-token count.
+      cum_in / cum_out   = session tokens IN (input+cache_read+cache_creation) and OUT
+                           (output), summed across EVERY message INCLUDING sidechains
+                           (subagent/Task turns). Cache reads recur each turn by design,
+                           so cum_in is a processed total, not a unique-token count.
+                           Deduped by API message id: the transcript logs the same
+                           assistant response on multiple lines (streaming partials +
+                           final), so a naive sum over-counts several-fold.
+      active_ms          = wall-clock minus the gaps where Claude finished and was
+                           waiting on YOU. Tool execution, background agents, and CI/CD
+                           watches all happen inside a turn, so they ARE counted; only
+                           the assistant-done -> your-next-message idle is excluded.
     """
     if not transcript_path or not os.path.exists(transcript_path):
-        return None, 0
+        return None, 0, 0, 0
 
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except:
-        return None, 0
+        return None, 0, 0, 0
 
     latest_ts = float('-inf')
     latest_usage = None
-    cumulative = 0
+    cum_in = 0
+    cum_out = 0
+    seen_ids = set()
+    timeline = []  # (ts, role, is_tool_result) for main-thread msgs -> active_ms
 
     for line in lines:
         line = line.strip()
@@ -189,16 +207,30 @@ def scan_transcript(transcript_path):
         except:
             continue
 
-        usage = j.get('message', {}).get('usage')
+        msg = j.get('message', {})
+        usage = msg.get('usage')
 
-        # Cumulative: count EVERY usage, including subagent (sidechain) turns.
+        # Active-time timeline: main-thread (non-sidechain) messages, in time order.
+        # Subagent wall-time is already captured as the main-thread gap between the
+        # Task tool_use and its tool_result, so sidechain lines are skipped here.
+        if not is_sub_context(j):
+            t = parse_timestamp(j)
+            if t != float('-inf'):
+                timeline.append((t, msg.get('role'), is_tool_result_msg(msg)))
+
+        # Cumulative in/out: count EVERY usage (incl. subagent sidechains) ONCE.
+        # Dedup by the API message id (fall back to the wrapper uuid) so streaming
+        # partials of the same response don't multiply the totals.
         if usage:
-            cumulative += (
-                usage.get('input_tokens', 0) +
-                usage.get('output_tokens', 0) +
-                usage.get('cache_read_input_tokens', 0) +
-                usage.get('cache_creation_input_tokens', 0)
-            )
+            mid = msg.get('id') or j.get('uuid')
+            if mid not in seen_ids:
+                seen_ids.add(mid)
+                cum_in += (
+                    usage.get('input_tokens', 0) +
+                    usage.get('cache_read_input_tokens', 0) +
+                    usage.get('cache_creation_input_tokens', 0)
+                )
+                cum_out += usage.get('output_tokens', 0)
 
         # Bar numerator: newest real main-context assistant usage only.
         if (is_sub_context(j) or
@@ -216,7 +248,18 @@ def scan_transcript(transcript_path):
         elif ts == latest_ts and used_total(usage) > used_total(latest_usage):
             latest_usage = usage
 
-    return latest_usage, cumulative
+    # Active time: sum gaps, excluding "assistant finished -> you send the next
+    # message" (a genuine user turn, not a tool_result). That idle is the only thing
+    # dropped; API generation + tool/agent/CI time between events all count.
+    timeline.sort(key=lambda x: x[0])
+    active_ms = 0
+    for (ta, ra, _), (tb, rb, tr_b) in zip(timeline, timeline[1:]):
+        if ra == 'assistant' and rb == 'user' and not tr_b:
+            continue  # waiting on you — don't count it
+        active_ms += (tb - ta) * 1000
+    active_ms = int(active_ms)
+
+    return latest_usage, cum_in, cum_out, active_ms
 
 def render_bar(used, window):
     """Bracketed gradient bar scaled to the real window. Filled cells use the bright
@@ -240,19 +283,37 @@ def render_bar(used, window):
             cells.append(f"{muted_color(tok)}░{reset}")
     return f"{edge}[{reset}" + "".join(cells) + f"{edge}]{reset}"
 
-def build_stats(input_data, cumulative):
-    """Returns the cost / tokens / duration segments that have values (else omitted)."""
+def build_stats(input_data, cum_in, cum_out, active_ms):
+    """Returns the cost / tokens / active-time segments that have values (else omitted)."""
     cost = input_data.get('cost') or {}
     segs = []
 
+    # Cost: Claude Code's own client-side figure (cost.total_cost_usd). It already
+    # accounts for per-model pricing, cache reads/writes, and input vs output — so we
+    # display it as-is rather than recomputing from a (rot-prone) local price table.
     c = cost.get('total_cost_usd')
     if isinstance(c, (int, float)):
         segs.append(f"\033[32m${c:.2f}\033[0m")
 
-    if cumulative > 0:
-        segs.append(f"\033[36m{format_tokens(cumulative)} tok\033[0m")
+    # Tokens in / out for the session. cum_in is cache-inclusive input; cum_out is
+    # generated output. Both are deduped in scan_transcript (the raw cumulative
+    # double-counts streamed partials, which is what made the old "tok" read high).
+    if cum_in > 0 or cum_out > 0:
+        segs.append(
+            f"\033[36m↑{format_tokens(cum_in)} ↓{format_tokens(cum_out)}\033[0m"
+        )
 
-    d = fmt_duration(cost.get('total_duration_ms')) if cost.get('total_duration_ms') is not None else None
+    # Time: ACTIVE time (transcript-derived) = wall-clock minus time spent waiting on
+    # you. It counts API generation + tool execution + background agents + CI/CD
+    # watches, and excludes the idle gap while Claude waits for your next message — so
+    # a prompt left open overnight doesn't inflate it. Fall back to the cost block's
+    # API time, then wall-clock, when the transcript isn't available.
+    t_ms = active_ms if active_ms and active_ms > 0 else None
+    if t_ms is None:
+        t_ms = cost.get('total_api_duration_ms')
+    if t_ms is None:
+        t_ms = cost.get('total_duration_ms')
+    d = fmt_duration(t_ms) if t_ms is not None else None
     if d:
         segs.append(f"\033[90m{d}\033[0m")
 
@@ -292,11 +353,11 @@ def main():
     transcript_path = input_data.get('transcript_path')
     window = detect_context_window(input_data)
 
-    # One transcript read -> current context usage + cumulative tokens (incl. subagents).
-    usage, cumulative = scan_transcript(transcript_path)
+    # One transcript read -> current context usage + cumulative in/out + active time.
+    usage, cum_in, cum_out, active_ms = scan_transcript(transcript_path)
 
     sep = " \033[90m|\033[0m "
-    stats = build_stats(input_data, cumulative)
+    stats = build_stats(input_data, cum_in, cum_out, active_ms)
 
     # Line 1 (unchanged): model | folder | git | clock
     parts = [
